@@ -1,0 +1,6 @@
+@SharpServer.Gateway_HostAddress = http://localhost:5208
+
+GET {{SharpServer.Gateway_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
