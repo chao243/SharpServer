@@ -1,0 +1,6 @@
+@SharpServer.GameServer_HostAddress = http://localhost:5102
+
+GET {{SharpServer.GameServer_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
