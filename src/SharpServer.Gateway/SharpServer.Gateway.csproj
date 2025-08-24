@@ -7,7 +7,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="MagicOnion.Client" Version="7.0.6" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="9.0.7" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SharpServer.Protocol\SharpServer.Protocol.csproj" />
   </ItemGroup>
 
 </Project>

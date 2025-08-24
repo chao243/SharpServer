@@ -1,0 +1,31 @@
+### Test Gateway to GameServer RPC communication
+
+### Get Player Info
+GET https://localhost:7165/api/players/1
+Accept: application/json
+
+### Get Player Info (non-existent)
+GET https://localhost:7165/api/players/999
+Accept: application/json
+
+### Create a new game
+POST https://localhost:7165/api/games
+Content-Type: application/json
+
+{
+    "gameName": "Test Game",
+    "maxPlayers": 4,
+    "creatorPlayerId": 1
+}
+
+### Get Game State
+GET https://localhost:7165/api/games/1
+Accept: application/json
+
+### Join a game
+POST https://localhost:7165/api/games/1/join
+Content-Type: application/json
+
+{
+    "playerId": 2
+}

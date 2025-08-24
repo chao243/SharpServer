@@ -1,4 +1,10 @@
+using MagicOnion.Server;
+
 var builder = WebApplication.CreateBuilder(args);
+
+// Add MagicOnion
+builder.Services.AddGrpc();
+builder.Services.AddMagicOnion();
 
 // Add services to the container.
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
@@ -11,6 +17,9 @@ if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
 }
+
+// Map MagicOnion services
+app.MapMagicOnionService();
 
 app.UseHttpsRedirection();
 
