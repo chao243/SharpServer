@@ -1,3 +1,7 @@
+using StackExchange.Redis;
+using SharpServer.Common.LoadBalancing;
+using SharpServer.Common.RpcClient;
+using SharpServer.Common.ServiceRegistry;
 using SharpServer.Gateway.Services;
 using SharpServer.Protocol;
 
@@ -7,7 +11,29 @@ var builder = WebApplication.CreateBuilder(args);
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
-// Register MagicOnion client
+// Configure Redis connection
+var redisConnectionString = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
+builder.Services.AddSingleton<IConnectionMultiplexer>(ConnectionMultiplexer.Connect(redisConnectionString));
+
+// Register service discovery and load balancing
+builder.Services.AddSingleton<IServiceRegistry, RedisServiceRegistry>();
+builder.Services.AddSingleton<ILoadBalancer, RoundRobinLoadBalancer>();
+
+// Configure RPC client options
+builder.Services.Configure<RpcClientOptions>(options =>
+{
+    options.ServiceName = "GameServer";
+    options.MaxRetries = 3;
+    options.ConnectionTimeout = TimeSpan.FromSeconds(10);
+    options.OperationTimeout = TimeSpan.FromSeconds(30);
+    options.MaxConnectionsPerService = 10;
+});
+
+// Register RPC client manager
+builder.Services.AddSingleton<IRpcClientManager<IGameService>, RpcClientManager<IGameService>>();
+builder.Services.AddSingleton<EnhancedGameServiceClient>();
+
+// Keep old client for backward compatibility
 var gameServerAddress = builder.Configuration.GetConnectionString("GameServer") ?? "https://localhost:7144";
 builder.Services.AddSingleton(new GameServiceClient(gameServerAddress));
 

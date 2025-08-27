@@ -12,7 +12,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="StackExchange.Redis" Version="2.8.16" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\SharpServer.Protocol\SharpServer.Protocol.csproj" />
+    <ProjectReference Include="..\SharpServer.Common\SharpServer.Common.csproj" />
   </ItemGroup>
 
 </Project>
