@@ -1,3 +1,6 @@
+using System;
+using System.Collections.Generic;
+
 namespace SharpServer.Common.ServiceRegistry;
 
 public interface IServiceRegistry
@@ -15,12 +18,25 @@ public class ServiceInfo
     public string ServiceName { get; set; } = string.Empty;
     public string Address { get; set; } = string.Empty;
     public int Port { get; set; }
+    public string Scheme { get; set; } = Uri.UriSchemeHttp;
     public string Version { get; set; } = "1.0";
     public Dictionary<string, string> Metadata { get; set; } = new();
     public ServiceStatus Status { get; set; } = ServiceStatus.Up;
     public DateTime LastHeartbeat { get; set; } = DateTime.UtcNow;
 
-    public string GetFullAddress() => $"https://{Address}:{Port}";
+    public string GetUri()
+    {
+        var builder = new UriBuilder
+        {
+            Scheme = string.IsNullOrWhiteSpace(Scheme) ? Uri.UriSchemeHttps : Scheme,
+            Host = Address,
+            Port = Port
+        };
+
+        return builder.Uri.ToString();
+    }
+
+    public string GetFullAddress() => GetUri();
 }
 
 public enum ServiceStatus

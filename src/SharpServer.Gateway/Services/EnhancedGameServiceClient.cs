@@ -1,6 +1,4 @@
-using SharpServer.Common.LoadBalancing;
 using SharpServer.Common.RpcClient;
-using SharpServer.Common.ServiceRegistry;
 using SharpServer.Protocol;
 
 namespace SharpServer.Gateway.Services;
@@ -16,30 +14,38 @@ public class EnhancedGameServiceClient : IDisposable
 
     public async Task<PlayerInfoResponse> GetPlayerInfoAsync(int playerId)
     {
-        return await _clientManager.ExecuteAsync(async client => 
-            await client.GetPlayerInfo(playerId));
+        return await _clientManager.ExecuteAsync(
+            async client => await client.GetPlayerInfo(playerId),
+            affinityKey: playerId.ToString());
     }
 
     public async Task<GameStateResponse> GetGameStateAsync(int gameId)
     {
-        return await _clientManager.ExecuteAsync(async client => 
-            await client.GetGameState(gameId));
+        return await _clientManager.ExecuteAsync(
+            async client => await client.GetGameState(gameId),
+            affinityKey: gameId.ToString());
     }
 
     public async Task<CreateGameResponse> CreateGameAsync(CreateGameRequest request)
     {
-        return await _clientManager.ExecuteAsync(async client => 
-            await client.CreateGame(request));
+        var affinity = request.CreatorPlayerId != 0 ? request.CreatorPlayerId.ToString() : null;
+        return await _clientManager.ExecuteAsync(
+            async client => await client.CreateGame(request),
+            affinityKey: affinity);
     }
 
     public async Task<JoinGameResponse> JoinGameAsync(JoinGameRequest request)
     {
-        return await _clientManager.ExecuteAsync(async client => 
-            await client.JoinGame(request));
+        return await _clientManager.ExecuteAsync(
+            async client => await client.JoinGame(request),
+            affinityKey: request.GameId.ToString());
     }
 
     public void Dispose()
     {
-        _clientManager?.Dispose();
+        if (_clientManager is IDisposable disposable)
+        {
+            disposable.Dispose();
+        }
     }
 }

@@ -1,243 +1,342 @@
+using System;
 using System.Collections.Concurrent;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Grpc.Core;
 using Grpc.Net.Client;
 using MagicOnion;
 using MagicOnion.Client;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using SharpServer.Common.LoadBalancing;
 using SharpServer.Common.ServiceRegistry;
 
 namespace SharpServer.Common.RpcClient;
 
-public class RpcClientManager<T> : IRpcClientManager<T>, IDisposable where T : class, IService<T>
+public sealed class RpcClientManager<T> : IRpcClientManager<T>, IDisposable where T : class, IService<T>
 {
     private readonly IServiceRegistry _serviceRegistry;
     private readonly ILoadBalancer _loadBalancer;
     private readonly ILogger<RpcClientManager<T>> _logger;
-    private readonly RpcClientOptions _options;
+    private readonly IOptionsMonitor<RpcClientOptions> _optionsMonitor;
     private readonly ConcurrentDictionary<string, ClientPool> _clientPools = new();
-    private readonly Timer _healthCheckTimer;
+    private readonly Timer _reconcileTimer;
 
     public RpcClientManager(
         IServiceRegistry serviceRegistry,
         ILoadBalancer loadBalancer,
         ILogger<RpcClientManager<T>> logger,
-        RpcClientOptions options)
+        IOptionsMonitor<RpcClientOptions> optionsMonitor)
     {
         _serviceRegistry = serviceRegistry;
         _loadBalancer = loadBalancer;
         _logger = logger;
-        _options = options;
-        
-        // Start health check timer
-        _healthCheckTimer = new Timer(HealthCheck, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+        _optionsMonitor = optionsMonitor;
+
+        var interval = TimeSpan.FromSeconds(30);
+        _reconcileTimer = new Timer(OnReconcile, null, interval, interval);
     }
 
-    public async Task<T> GetClientAsync()
+    public async Task<TResult> ExecuteAsync<TResult>(Func<T, Task<TResult>> operation, string? affinityKey = null, int? maxRetries = null, CancellationToken cancellationToken = default)
     {
-        var services = await _serviceRegistry.DiscoverServicesAsync(_options.ServiceName);
-        var selectedService = await _loadBalancer.SelectServiceAsync(services);
-        
-        if (selectedService == null)
-        {
-            throw new InvalidOperationException($"No available services found for {_options.ServiceName}");
-        }
-
-        var pool = _clientPools.GetOrAdd(selectedService.ServiceId, 
-            _ => new ClientPool(selectedService, _options));
-        
-        return await pool.GetClientAsync();
-    }
-
-    public async Task<TResult> ExecuteAsync<TResult>(Func<T, Task<TResult>> operation, int maxRetries = 3)
-    {
+        var options = _optionsMonitor.CurrentValue;
+        var retryLimit = maxRetries ?? options.MaxRetries;
         Exception? lastException = null;
-        
-        for (int attempt = 0; attempt <= maxRetries; attempt++)
+
+        for (var attempt = 0; attempt <= retryLimit; attempt++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var lease = await AcquireClientAsync(options.ServiceName, affinityKey, cancellationToken);
             try
             {
-                var client = await GetClientAsync();
-                var result = await operation(client);
-                
-                // Record success for load balancer
-                var services = await _serviceRegistry.DiscoverServicesAsync(_options.ServiceName);
-                var currentService = services.FirstOrDefault(s => s.ServiceId == GetServiceIdFromClient(client));
-                if (currentService != null)
-                {
-                    _loadBalancer.RecordSuccess(currentService);
-                }
-                
+                var result = await operation(lease.Client);
+                _loadBalancer.RecordSuccess(lease.ServiceId);
+                lease.ReturnToPool();
                 return result;
             }
-            catch (RpcException ex) when (IsRetryable(ex) && attempt < maxRetries)
+            catch (RpcException ex) when (ShouldRetry(ex.StatusCode) && attempt < retryLimit)
             {
                 lastException = ex;
-                _logger.LogWarning(ex, "RPC call failed (attempt {Attempt}/{MaxRetries})", attempt + 1, maxRetries + 1);
-                
-                // Record failure for load balancer
-                var services = await _serviceRegistry.DiscoverServicesAsync(_options.ServiceName);
-                var failedService = services.FirstOrDefault();
-                if (failedService != null)
-                {
-                    _loadBalancer.RecordFailure(failedService);
-                }
-                
-                await Task.Delay(TimeSpan.FromMilliseconds(Math.Pow(2, attempt) * 100)); // Exponential backoff
+                _logger.LogWarning(ex, "RPC 调用失败，已重试 {Attempt}/{Max}", attempt + 1, retryLimit + 1);
+                _loadBalancer.RecordFailure(lease.ServiceId, ex);
+                lease.Discard();
+                await Task.Delay(ComputeBackoff(attempt, options.RetryBackoff), cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                lease.Discard();
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Non-retryable RPC error");
+                lease.Discard();
+                _logger.LogError(ex, "RPC 调用出现不可重试异常");
                 throw;
             }
         }
-        
-        throw lastException ?? new InvalidOperationException("RPC operation failed after all retries");
+
+        throw lastException ?? new InvalidOperationException("RPC 调用在所有重试后仍失败");
     }
 
-    public async Task ExecuteAsync(Func<T, Task> operation, int maxRetries = 3)
+    public Task ExecuteAsync(Func<T, Task> operation, string? affinityKey = null, int? maxRetries = null, CancellationToken cancellationToken = default)
     {
-        await ExecuteAsync(async client =>
+        return ExecuteAsync(async client =>
         {
             await operation(client);
-            return true; // Dummy return value
-        }, maxRetries);
+            return true;
+        }, affinityKey, maxRetries, cancellationToken);
     }
 
-    private bool IsRetryable(RpcException ex)
+    public void Dispose()
     {
-        return ex.StatusCode switch
+        _reconcileTimer.Dispose();
+
+        foreach (var pool in _clientPools.Values)
         {
-            StatusCode.Unavailable => true,
-            StatusCode.DeadlineExceeded => true,
-            StatusCode.ResourceExhausted => true,
-            StatusCode.Aborted => true,
-            StatusCode.Internal => true,
-            _ => false
-        };
+            pool.Dispose();
+        }
+
+        _clientPools.Clear();
     }
 
-    private string GetServiceIdFromClient(T client)
+    private async Task<ClientLease> AcquireClientAsync(string serviceName, string? affinityKey, CancellationToken cancellationToken)
     {
-        // This is a simplified approach. In practice, you'd need to track
-        // which service each client is connected to.
-        return "unknown";
+        var services = await _serviceRegistry.DiscoverServicesAsync(serviceName);
+        var selected = await _loadBalancer.SelectServiceAsync(serviceName, services, affinityKey, cancellationToken);
+
+        if (selected == null)
+        {
+            throw new InvalidOperationException($"未找到可用的服务实例：{serviceName}");
+        }
+
+        var options = _optionsMonitor.CurrentValue;
+        var pool = _clientPools.AddOrUpdate(
+            selected.ServiceId,
+            _ => new ClientPool(selected, options, _logger),
+            (_, existing) => existing.WithLatestConfiguration(selected, options));
+
+        var wrapper = await pool.RentAsync(cancellationToken);
+        return new ClientLease(selected.ServiceId, pool, wrapper);
     }
 
-    private async void HealthCheck(object? state)
+    private void OnReconcile(object? state)
     {
         try
         {
-            var services = await _serviceRegistry.DiscoverServicesAsync(_options.ServiceName);
-            
-            // Remove pools for services that are no longer available
+            var options = _optionsMonitor.CurrentValue;
+            var services = _serviceRegistry.DiscoverServicesAsync(options.ServiceName).GetAwaiter().GetResult();
             var activeServiceIds = services.Select(s => s.ServiceId).ToHashSet();
-            var poolsToRemove = _clientPools.Keys.Where(id => !activeServiceIds.Contains(id)).ToList();
-            
-            foreach (var serviceId in poolsToRemove)
+
+            foreach (var entry in _clientPools)
             {
-                if (_clientPools.TryRemove(serviceId, out var pool))
+                if (!activeServiceIds.Contains(entry.Key))
                 {
-                    pool.Dispose();
+                    if (_clientPools.TryRemove(entry.Key, out var pool))
+                    {
+                        pool.Dispose();
+                    }
                 }
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Health check failed");
+            _logger.LogError(ex, "同步 RPC 客户端池失败");
         }
     }
 
-    public void Dispose()
+    private static bool ShouldRetry(StatusCode statusCode) => statusCode switch
     {
-        _healthCheckTimer?.Dispose();
-        
-        foreach (var pool in _clientPools.Values)
+        StatusCode.Unavailable => true,
+        StatusCode.DeadlineExceeded => true,
+        StatusCode.ResourceExhausted => true,
+        StatusCode.Aborted => true,
+        StatusCode.Internal => true,
+        _ => false
+    };
+
+    private static TimeSpan ComputeBackoff(int attempt, RetryBackoffOptions backoff)
+    {
+        var exponent = Math.Min(attempt, backoff.MaxExponent);
+        var delayMs = backoff.BaseMilliseconds * Math.Pow(backoff.Multiplier, exponent);
+        delayMs = Math.Min(delayMs, backoff.MaxMilliseconds);
+        return TimeSpan.FromMilliseconds(delayMs);
+    }
+
+    private sealed class ClientLease
+    {
+        private readonly ClientPool _pool;
+        private readonly ClientWrapper _wrapper;
+        private bool _returned;
+
+        public string ServiceId { get; }
+        public T Client => _wrapper.Client;
+
+        public ClientLease(string serviceId, ClientPool pool, ClientWrapper wrapper)
         {
-            pool.Dispose();
+            ServiceId = serviceId;
+            _pool = pool;
+            _wrapper = wrapper;
         }
-        
-        _clientPools.Clear();
+
+        public void ReturnToPool()
+        {
+            if (_returned)
+            {
+                return;
+            }
+
+            _returned = true;
+            _pool.Return(_wrapper);
+        }
+
+        public void Discard()
+        {
+            if (_returned)
+            {
+                return;
+            }
+
+            _returned = true;
+            _pool.Discard(_wrapper);
+        }
     }
 
-    private class ClientPool : IDisposable
+    private sealed class ClientPool : IDisposable
     {
-        private readonly ServiceInfo _serviceInfo;
-        private readonly RpcClientOptions _options;
-        private readonly ConcurrentQueue<ClientWrapper> _clients = new();
+        private readonly object _syncRoot = new();
+        private ServiceInfo _serviceInfo;
+        private RpcClientOptions _options;
+        private readonly ILogger _logger;
+        private readonly ConcurrentQueue<ClientWrapper> _queue = new();
         private readonly SemaphoreSlim _semaphore;
-        private int _clientCount;
+        private bool _disposed;
 
-        public ClientPool(ServiceInfo serviceInfo, RpcClientOptions options)
+        public ClientPool(ServiceInfo serviceInfo, RpcClientOptions options, ILogger logger)
         {
             _serviceInfo = serviceInfo;
             _options = options;
+            _logger = logger;
             _semaphore = new SemaphoreSlim(options.MaxConnectionsPerService, options.MaxConnectionsPerService);
         }
 
-        public async Task<T> GetClientAsync()
+        public ClientPool WithLatestConfiguration(ServiceInfo serviceInfo, RpcClientOptions options)
         {
-            await _semaphore.WaitAsync();
-            
-            try
+            lock (_syncRoot)
             {
-                if (_clients.TryDequeue(out var wrapper) && wrapper.IsHealthy)
-                {
-                    return wrapper.Client;
-                }
-                
-                // Create new client
-                var channel = GrpcChannel.ForAddress(_serviceInfo.GetFullAddress());
-                var client = MagicOnionClient.Create<T>(channel);
-                
-                Interlocked.Increment(ref _clientCount);
-                
-                return client;
+                _serviceInfo = serviceInfo;
+                _options = options;
             }
-            finally
-            {
-                _semaphore.Release();
-            }
+
+            return this;
         }
 
-        public void ReturnClient(T client)
+        public async Task<ClientWrapper> RentAsync(CancellationToken cancellationToken)
         {
-            if (_clientCount <= _options.MaxConnectionsPerService)
+            await _semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+            while (_queue.TryDequeue(out var wrapper))
             {
-                _clients.Enqueue(new ClientWrapper(client));
+                if (wrapper.IsHealthy)
+                {
+                    return wrapper;
+                }
+
+                wrapper.Dispose();
+            }
+
+            return CreateWrapper();
+        }
+
+        public void Return(ClientWrapper wrapper)
+        {
+            wrapper.Touch();
+            _queue.Enqueue(wrapper);
+            _semaphore.Release();
+        }
+
+        public void Discard(ClientWrapper wrapper)
+        {
+            wrapper.Dispose();
+            _semaphore.Release();
+        }
+
+        private ClientWrapper CreateWrapper()
+        {
+            try
+            {
+                var address = new Uri(_serviceInfo.GetUri());
+                var useTls = string.Equals(address.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) && _options.EnableTls;
+
+                var channelOptions = new GrpcChannelOptions
+                {
+                    HttpHandler = _options.HttpHandlerFactory?.Invoke(),
+                    Credentials = useTls ? ChannelCredentials.SecureSsl : ChannelCredentials.Insecure
+                };
+
+                if (!useTls && string.Equals(address.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+                {
+                    address = new UriBuilder(address) { Scheme = Uri.UriSchemeHttp }.Uri;
+                }
+
+                var channel = GrpcChannel.ForAddress(address, channelOptions);
+                var client = MagicOnionClient.Create<T>(channel);
+                return new ClientWrapper(channel, client);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "创建 gRPC 客户端失败，地址：{Address}", _serviceInfo.GetUri());
+                throw;
             }
         }
 
         public void Dispose()
         {
-            while (_clients.TryDequeue(out var wrapper))
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+
+            while (_queue.TryDequeue(out var wrapper))
             {
                 wrapper.Dispose();
             }
-            
-            _semaphore?.Dispose();
+
+            _semaphore.Dispose();
+        }
+    }
+
+    private sealed class ClientWrapper : IDisposable
+    {
+        private readonly GrpcChannel _channel;
+        public T Client { get; }
+        private DateTime _lastUsed;
+
+        public ClientWrapper(GrpcChannel channel, T client)
+        {
+            _channel = channel;
+            Client = client;
+            _lastUsed = DateTime.UtcNow;
         }
 
-        private class ClientWrapper : IDisposable
+        public bool IsHealthy => DateTime.UtcNow - _lastUsed < TimeSpan.FromMinutes(5);
+
+        public void Touch()
         {
-            public T Client { get; }
-            public DateTime LastUsed { get; private set; }
+            _lastUsed = DateTime.UtcNow;
+        }
 
-            public bool IsHealthy => DateTime.UtcNow - LastUsed < TimeSpan.FromMinutes(5);
-
-            public ClientWrapper(T client)
+        public void Dispose()
+        {
+            if (Client is IDisposable disposable)
             {
-                Client = client;
-                LastUsed = DateTime.UtcNow;
+                disposable.Dispose();
             }
 
-            public void Dispose()
-            {
-                if (Client is IDisposable disposable)
-                {
-                    disposable.Dispose();
-                }
-            }
+            _channel.Dispose();
         }
     }
 }

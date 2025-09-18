@@ -1,3 +1,6 @@
+using System.Net.Http;
+using DotNetEtcd;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using StackExchange.Redis;
 using SharpServer.Common.LoadBalancing;
 using SharpServer.Common.RpcClient;
@@ -5,48 +8,61 @@ using SharpServer.Common.ServiceRegistry;
 using SharpServer.Gateway.Services;
 using SharpServer.Protocol;
 
+AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
+// 服务注册与发现配置
+var registrySection = builder.Configuration.GetSection("ServiceRegistry");
+var registryProvider = registrySection.GetValue("Provider", "Redis");
+var registryKeyPrefix = registrySection.GetValue("KeyPrefix", "sharpserver");
+
+if (string.Equals(registryProvider, "Etcd", StringComparison.OrdinalIgnoreCase))
+{
+    var endpoint = registrySection.GetSection("Etcd").GetValue("Endpoint", "http://localhost:2379");
+    builder.Services.TryAddSingleton(_ => new EtcdClient(endpoint));
+    builder.Services.AddSingleton<IServiceRegistry>(sp =>
+        new EtcdServiceRegistry(sp.GetRequiredService<EtcdClient>(), registryKeyPrefix));
+}
+else
+{
+    var redisConnectionString = registrySection.GetSection("Redis").GetValue(
+        "ConnectionString",
+        builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379");
+
+    builder.Services.TryAddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(redisConnectionString));
+    builder.Services.AddSingleton<IServiceRegistry>(sp =>
+        new RedisServiceRegistry(sp.GetRequiredService<IConnectionMultiplexer>(), registryKeyPrefix));
+}
+
+// 依赖注册
 builder.Services.AddOpenApi();
+builder.Services.AddSingleton<ILoadBalancer, ConsistentHashLoadBalancer>();
 
-// Configure Redis connection
-var redisConnectionString = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
-builder.Services.AddSingleton<IConnectionMultiplexer>(ConnectionMultiplexer.Connect(redisConnectionString));
-
-// Register service discovery and load balancing
-builder.Services.AddSingleton<IServiceRegistry, RedisServiceRegistry>();
-builder.Services.AddSingleton<ILoadBalancer, RoundRobinLoadBalancer>();
-
-// Configure RPC client options
 builder.Services.Configure<RpcClientOptions>(options =>
 {
     options.ServiceName = "GameServer";
     options.MaxRetries = 3;
-    options.ConnectionTimeout = TimeSpan.FromSeconds(10);
-    options.OperationTimeout = TimeSpan.FromSeconds(30);
-    options.MaxConnectionsPerService = 10;
+    options.MaxConnectionsPerService = 32;
+    options.RetryBackoff = new RetryBackoffOptions(BaseMilliseconds: 100, Multiplier: 2.0, MaxExponent: 5, MaxMilliseconds: 5_000);
+    options.HttpHandlerFactory = () => new SocketsHttpHandler
+    {
+        EnableMultipleHttp2Connections = true,
+        PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2)
+    };
 });
 
-// Register RPC client manager
 builder.Services.AddSingleton<IRpcClientManager<IGameService>, RpcClientManager<IGameService>>();
 builder.Services.AddSingleton<EnhancedGameServiceClient>();
 
-// Keep old client for backward compatibility
-var gameServerAddress = builder.Configuration.GetConnectionString("GameServer") ?? "https://localhost:7144";
-builder.Services.AddSingleton(new GameServiceClient(gameServerAddress));
-
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
 }
 
-// Game API endpoints
-app.MapGet("/api/players/{playerId:int}", async (int playerId, GameServiceClient client) =>
+app.MapGet("/api/players/{playerId:int}", async (int playerId, EnhancedGameServiceClient client) =>
 {
     try
     {
@@ -57,10 +73,9 @@ app.MapGet("/api/players/{playerId:int}", async (int playerId, GameServiceClient
     {
         return Results.Problem($"Error getting player info: {ex.Message}");
     }
-})
-.WithName("GetPlayerInfo");
+}).WithName("GetPlayerInfo");
 
-app.MapGet("/api/games/{gameId:int}", async (int gameId, GameServiceClient client) =>
+app.MapGet("/api/games/{gameId:int}", async (int gameId, EnhancedGameServiceClient client) =>
 {
     try
     {
@@ -71,10 +86,9 @@ app.MapGet("/api/games/{gameId:int}", async (int gameId, GameServiceClient clien
     {
         return Results.Problem($"Error getting game state: {ex.Message}");
     }
-})
-.WithName("GetGameState");
+}).WithName("GetGameState");
 
-app.MapPost("/api/games", async (CreateGameRequest request, GameServiceClient client) =>
+app.MapPost("/api/games", async (CreateGameRequest request, EnhancedGameServiceClient client) =>
 {
     try
     {
@@ -85,14 +99,13 @@ app.MapPost("/api/games", async (CreateGameRequest request, GameServiceClient cl
     {
         return Results.Problem($"Error creating game: {ex.Message}");
     }
-})
-.WithName("CreateGame");
+}).WithName("CreateGame");
 
-app.MapPost("/api/games/{gameId:int}/join", async (int gameId, JoinGameRequest request, GameServiceClient client) =>
+app.MapPost("/api/games/{gameId:int}/join", async (int gameId, JoinGameRequest request, EnhancedGameServiceClient client) =>
 {
     try
     {
-        request.GameId = gameId; // Ensure gameId from route matches request
+        request.GameId = gameId;
         var response = await client.JoinGameAsync(request);
         return Results.Ok(response);
     }
@@ -100,30 +113,26 @@ app.MapPost("/api/games/{gameId:int}/join", async (int gameId, JoinGameRequest r
     {
         return Results.Problem($"Error joining game: {ex.Message}");
     }
-})
-.WithName("JoinGame");
+}).WithName("JoinGame");
 
 var summaries = new[]
 {
     "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
 };
 
-app.MapGet("/hello", () => "hello")
-    .WithName("Hello");
+app.MapGet("/hello", () => "hello").WithName("Hello");
 
 app.MapGet("/weatherforecast", () =>
 {
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
+    var forecast = Enumerable.Range(1, 5).Select(index =>
         new WeatherForecast
         (
             DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
             Random.Shared.Next(-20, 55),
             summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
+        )).ToArray();
     return forecast;
-})
-.WithName("GetWeatherForecast");
+}).WithName("GetWeatherForecast");
 
 app.Run();
 

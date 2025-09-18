@@ -1,75 +1,153 @@
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
 using SharpServer.Common.ServiceRegistry;
 
 namespace SharpServer.Common.LoadBalancing;
 
 public class RoundRobinLoadBalancer : ILoadBalancer
 {
-    private readonly ConcurrentDictionary<string, int> _counters = new();
-    private readonly ConcurrentDictionary<string, ServiceHealth> _healthMap = new();
+    private readonly ConcurrentDictionary<string, CounterState> _counters = new();
+    private readonly ConcurrentDictionary<string, ServiceHealth> _health = new();
 
-    public Task<ServiceInfo?> SelectServiceAsync(List<ServiceInfo> services)
+    private static readonly TimeSpan EvaluationWindow = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan OpenCircuitDuration = TimeSpan.FromSeconds(30);
+    private const double FailureThreshold = 0.5;
+    private const int MinimumSampleSize = 5;
+
+    public Task<ServiceInfo?> SelectServiceAsync(string serviceName, IReadOnlyList<ServiceInfo> services, string? affinityKey = null, CancellationToken cancellationToken = default)
     {
-        if (!services.Any())
+        if (services.Count == 0)
+        {
             return Task.FromResult<ServiceInfo?>(null);
+        }
 
-        // Filter healthy services
-        var healthyServices = services.Where(IsHealthy).ToList();
-        if (!healthyServices.Any())
+        var upServices = services.Where(s => s.Status == ServiceStatus.Up).ToList();
+        if (upServices.Count == 0)
+        {
             return Task.FromResult<ServiceInfo?>(null);
+        }
 
-        var serviceName = healthyServices.First().ServiceName;
-        var counter = _counters.AddOrUpdate(serviceName, 0, (_, current) => (current + 1) % healthyServices.Count);
-        
-        return Task.FromResult<ServiceInfo?>(healthyServices[counter]);
+        var healthy = upServices.Where(s => IsHealthy(s.ServiceId)).ToList();
+        var candidates = healthy.Count > 0 ? healthy : upServices;
+
+        var counter = _counters.GetOrAdd(serviceName, _ => new CounterState());
+        var index = (int)(counter.Next() % (uint)candidates.Count);
+        var selected = candidates[index];
+        return Task.FromResult<ServiceInfo?>(selected);
     }
 
-    public void RecordSuccess(ServiceInfo service)
+    public void RecordSuccess(string serviceId)
     {
-        _healthMap.AddOrUpdate(service.ServiceId, 
-            new ServiceHealth { SuccessCount = 1, FailureCount = 0 },
-            (_, health) => 
+        var health = _health.GetOrAdd(serviceId, _ => new ServiceHealth());
+        health.RecordSuccess();
+    }
+
+    public void RecordFailure(string serviceId, Exception? exception = null)
+    {
+        var health = _health.GetOrAdd(serviceId, _ => new ServiceHealth());
+        health.RecordFailure();
+    }
+
+    private bool IsHealthy(string serviceId)
+    {
+        if (!_health.TryGetValue(serviceId, out var health))
+        {
+            return true;
+        }
+
+        return health.IsHealthy();
+    }
+
+    private sealed class CounterState
+    {
+        private int _value = -1;
+
+        public uint Next()
+        {
+            return (uint)Interlocked.Increment(ref _value);
+        }
+    }
+
+    private sealed class ServiceHealth
+    {
+        private double _successes;
+        private double _failures;
+        private DateTime _lastSample = DateTime.UtcNow;
+        private DateTime _circuitOpenUntil = DateTime.MinValue;
+        private readonly object _lock = new();
+
+        public void RecordSuccess()
+        {
+            lock (_lock)
             {
-                health.SuccessCount++;
-                health.LastSuccess = DateTime.UtcNow;
-                return health;
-            });
-    }
+                ApplyDecay();
+                _successes += 1d;
+                _circuitOpenUntil = DateTime.MinValue;
+            }
+        }
 
-    public void RecordFailure(ServiceInfo service)
-    {
-        _healthMap.AddOrUpdate(service.ServiceId,
-            new ServiceHealth { SuccessCount = 0, FailureCount = 1 },
-            (_, health) =>
+        public void RecordFailure()
+        {
+            lock (_lock)
             {
-                health.FailureCount++;
-                health.LastFailure = DateTime.UtcNow;
-                return health;
-            });
-    }
+                ApplyDecay();
+                _failures += 1d;
+                EvaluateCircuit();
+            }
+        }
 
-    private bool IsHealthy(ServiceInfo service)
-    {
-        if (!_healthMap.TryGetValue(service.ServiceId, out var health))
-            return true; // New service is considered healthy
+        public bool IsHealthy()
+        {
+            lock (_lock)
+            {
+                ApplyDecay();
 
-        // Circuit breaker logic: if failure rate > 50% in last minute, mark as unhealthy
-        var recentFailures = health.FailureCount;
-        var recentSuccesses = health.SuccessCount;
-        var totalRequests = recentFailures + recentSuccesses;
+                if (DateTime.UtcNow < _circuitOpenUntil)
+                {
+                    return false;
+                }
 
-        if (totalRequests < 5)
-            return true; // Not enough data
+                var total = _successes + _failures;
+                if (total < MinimumSampleSize)
+                {
+                    return true;
+                }
 
-        var failureRate = (double)recentFailures / totalRequests;
-        return failureRate < 0.5;
-    }
+                var failureRate = _failures / total;
+                return failureRate <= FailureThreshold;
+            }
+        }
 
-    private class ServiceHealth
-    {
-        public int SuccessCount { get; set; }
-        public int FailureCount { get; set; }
-        public DateTime LastSuccess { get; set; }
-        public DateTime LastFailure { get; set; }
+        private void ApplyDecay()
+        {
+            var now = DateTime.UtcNow;
+            var elapsed = now - _lastSample;
+            if (elapsed <= TimeSpan.Zero)
+            {
+                return;
+            }
+
+            var decayFactor = Math.Exp(-elapsed.TotalSeconds / EvaluationWindow.TotalSeconds);
+            _successes *= decayFactor;
+            _failures *= decayFactor;
+            _lastSample = now;
+        }
+
+        private void EvaluateCircuit()
+        {
+            var total = _successes + _failures;
+            if (total < MinimumSampleSize)
+            {
+                return;
+            }
+
+            var failureRate = _failures / total;
+            if (failureRate > FailureThreshold)
+            {
+                _circuitOpenUntil = DateTime.UtcNow.Add(OpenCircuitDuration);
+            }
+        }
     }
 }

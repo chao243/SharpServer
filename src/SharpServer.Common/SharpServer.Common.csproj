@@ -7,7 +7,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="DotNetEtcd" Version="6.3.4" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.66.0" />
     <PackageReference Include="MagicOnion.Client" Version="7.0.6" />
+    <PackageReference Include="Microsoft.AspNetCore.Hosting.Abstractions" Version="9.0.0" />
     <PackageReference Include="StackExchange.Redis" Version="2.8.16" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
